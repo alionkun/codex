@@ -78,6 +78,18 @@ pub async fn run_main(
     cli: Cli,
     codex_linux_sandbox_exe: Option<PathBuf>,
 ) -> std::io::Result<codex_core::protocol::TokenUsage> {
+    // 中文说明:
+    // `run_main` 是交互式 TUI 的入口函数，它负责：
+    // 1. 根据传入的 CLI 标志计算最终的 sandbox mode 和 approval policy；
+    // 2. 将 CLI 级别的覆盖（包括 `codex_linux_sandbox_exe`）封装进 `ConfigOverrides`，并加载最终的 `Config`；
+    // 3. 初始化日志（tracing）、persistence（session 日志）和 OSS 模型准备工作；
+    // 4. 处理首次运行的 onboarding 流（目录信任、登录提示等）；
+    // 5. 启动实际的 TUI 应用（`run_ratatui_app`），并在退出时收集并返回 token 使用统计。
+    //
+    // 关于 `codex_linux_sandbox_exe`:
+    // - 这是从 `arg0` 分发器传入的可选 PathBuf，用于在 Linux 平台上显式传递当前可执行文件路径，
+    //   下游的 Config/工具在需要 spawn sandbox helper 时会使用它来确保使用与当前主进程相同的二进制。
+    // - 在这里 `codex_linux_sandbox_exe` 会被放入 `ConfigOverrides`，并在 `Config::load_with_cli_overrides` 中被读入到最终配置 `Config`。
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),

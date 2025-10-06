@@ -21,6 +21,23 @@ use crate::proto::ProtoCli;
 
 /// Codex CLI
 ///
+/// 说明（中文注释）:
+/// 这个文件是程序的入口（binary 的 main），它使用 clap 定义多子命令（multitool）模式。
+/// 主要职责：
+/// - 解析命令行参数；
+/// - 将根级的 `--config` 类覆盖参数（`CliConfigOverrides`）按优先级注入到子命令；
+/// - 将无子命令时的行为（默认进入交互式 TUI）与显式子命令路由到对应的模块（`codex_tui`、`codex_exec`、`codex_mcp_server` 等）。
+///
+/// 关于 `arg0_dispatch_or_else` 和 `codex_linux_sandbox_exe`:
+/// 本仓库使用了一个 `arg0` 分发器（见 `codex-arg0` crate），允许同一个可执行文件通过不同的 `argv[0]` 或首个参数模拟为多个工具（例如内置的 `apply_patch` 或 `codex-linux-sandbox`）。
+/// `arg0_dispatch_or_else` 会在运行时检查 argv 并根据需要直接转向内部工具实现；否则它会调用传入的闭包继续启动主 CLI。
+///
+/// `arg0_dispatch_or_else` 将会把一个 `Option<PathBuf>` 作为参数传给主流程（这里命名为 `codex_linux_sandbox_exe`）：
+/// - 在 Linux 平台上，如果需要在子进程中以当前可执行文件启动 sandbox helper，会把 `Some(current_exe)` 传入；
+/// - 其它平台或不需要时传 `None`。
+///
+/// 这样设计的好处是：启动时就把可执行文件路径显式传递下去，避免在多线程或异步环境中再次去调用 `std::env::current_exe()` （可能会失败或产生竞态），并让下游代码在需要时能够用来 spawn sandboxed helpers。
+///
 /// If no subcommand is specified, options will be forwarded to the interactive CLI.
 #[derive(Debug, Parser)]
 #[clap(
@@ -147,6 +164,7 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
 
     match cli.subcommand {
         None => {
+            // 交互式 TUI 模式（默认）
             let mut tui_cli = cli.interactive;
             prepend_config_flags(&mut tui_cli.config_overrides, cli.config_overrides);
             let usage = codex_tui::run_main(tui_cli, codex_linux_sandbox_exe).await?;
@@ -228,8 +246,13 @@ fn prepend_config_flags(
         .splice(0..0, cli_config_overrides.raw_overrides);
 }
 
+// 将根级别的 config overrides 插入到子命令 overrides 的最前面，
+// 使得命令行子命令后面指定的 overrides 拥有更高的优先级（在应用时会覆盖根级值）。
+
 fn print_completion(cmd: CompletionCommand) {
     let mut app = MultitoolCli::command();
     let name = "codex";
     generate(cmd.shell, &mut app, name, &mut std::io::stdout());
 }
+
+// 生成 shell completion 脚本的工具函数，基于 clap-complete。

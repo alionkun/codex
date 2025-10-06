@@ -1,3 +1,7 @@
+//! 定义客户端和代理之间 Codex 会话的协议。
+//!
+//! 使用 SQ (提交队列) / EQ (事件队列) 模式在用户和代理之间进行异步通信。
+//!
 //! Defines the protocol for a Codex session between a client and an agent.
 //!
 //! Uses a SQ (Submission Queue) / EQ (Event Queue) pattern to asynchronously communicate
@@ -27,85 +31,111 @@ use crate::models::ResponseItem;
 use crate::parse_command::ParsedCommand;
 use crate::plan_tool::UpdatePlanArgs;
 
+/// 提交队列条目 - 来自用户的请求
 /// Submission Queue Entry - requests from user
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Submission {
+    /// 此提交的唯一 ID，用于与事件关联
     /// Unique id for this Submission to correlate with Events
     pub id: String,
+    /// 有效载荷
     /// Payload
     pub op: Op,
 }
 
+/// 提交操作
 /// Submission operation
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
+    /// 终止当前任务
+    /// 服务器响应发送 [`EventMsg::TurnAborted`]
     /// Abort current task.
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
 
+    /// 来自用户的输入
     /// Input from the user
     UserInput {
+        /// 用户输入项，参见 `InputItem`
         /// User input items, see `InputItem`
         items: Vec<InputItem>,
     },
 
+    /// 类似于 [`Op::UserInput`]，但包含 [`crate::codex_conversation::CodexConversation`] 一轮对话所需的额外上下文
     /// Similar to [`Op::UserInput`], but contains additional context required
     /// for a turn of a [`crate::codex_conversation::CodexConversation`].
     UserTurn {
+        /// 用户输入项，参见 `InputItem`
         /// User input items, see `InputItem`
         items: Vec<InputItem>,
 
+        /// 与 [`SandboxPolicy`] 和可能的工具调用（如 `local_shell`）一起使用的 `cwd`
         /// `cwd` to use with the [`SandboxPolicy`] and potentially tool calls
         /// such as `local_shell`.
         cwd: PathBuf,
 
+        /// 用于命令批准的策略
         /// Policy to use for command approval.
         approval_policy: AskForApproval,
 
+        /// 用于工具调用（如 `local_shell`）的策略
         /// Policy to use for tool calls such as `local_shell`.
         sandbox_policy: SandboxPolicy,
 
+        /// 必须是与此对话关联的 [`crate::client::ModelClient`] 的有效模型标识符
         /// Must be a valid model slug for the [`crate::client::ModelClient`]
         /// associated with this conversation.
         model: String,
 
+        /// 仅当模型配置为使用推理时才会生效
         /// Will only be honored if the model is configured to use reasoning.
         effort: ReasoningEffortConfig,
 
+        /// 仅当模型配置为使用推理时才会生效
         /// Will only be honored if the model is configured to use reasoning.
         summary: ReasoningSummaryConfig,
     },
 
+    /// 覆盖后续轮次的持久性轮次上下文的部分内容
+    ///
+    /// 所有字段都是可选的；省略时，保留现有值
+    /// 这不会排队任何输入 - 它只更新用于将来 `UserInput` 轮次的默认值
     /// Override parts of the persistent turn context for subsequent turns.
     ///
     /// All fields are optional; when omitted, the existing value is preserved.
     /// This does not enqueue any input – it only updates defaults used for
     /// future `UserInput` turns.
     OverrideTurnContext {
+        /// 用于沙盒/工具调用的更新 `cwd`
         /// Updated `cwd` for sandbox/tool calls.
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
 
+        /// 更新的命令批准策略
         /// Updated command approval policy.
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<AskForApproval>,
 
+        /// 用于工具调用的更新沙盒策略
         /// Updated sandbox policy for tool calls.
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox_policy: Option<SandboxPolicy>,
 
+        /// 更新的模型标识符。设置时，自动派生模型系列
         /// Updated model slug. When set, the model family is derived
         /// automatically.
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
 
+        /// 更新的推理努力（仅对具有推理能力的模型有效）
         /// Updated reasoning effort (honored only for reasoning-capable models).
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<ReasoningEffortConfig>,
 
+        /// 更新的推理摘要偏好（仅对具有推理能力的模型有效）
         /// Updated reasoning summary preference (honored only for reasoning-capable models).
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<ReasoningSummaryConfig>,
@@ -158,12 +188,15 @@ pub enum Op {
     Shutdown,
 }
 
+/// 确定用户被咨询批准运行 Codex 提议的命令的条件
 /// Determines the conditions under which the user is consulted to approve
 /// running the command proposed by Codex.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Display, TS)]
 #[serde(rename_all = "kebab-case")]
 #[strum(serialize_all = "kebab-case")]
 pub enum AskForApproval {
+    /// 在此策略下，只有由 `is_safe_command()` 确定的"已知安全"命令
+    /// 且**仅读取文件**的命令才会自动批准。其他所有命令都会要求用户批准
     /// Under this policy, only "known safe" commands—as determined by
     /// `is_safe_command()`—that **only read files** are auto‑approved.
     /// Everything else will ask the user to approve.
@@ -171,34 +204,42 @@ pub enum AskForApproval {
     #[strum(serialize = "untrusted")]
     UnlessTrusted,
 
+    /// *所有*命令都自动批准，但预期在沙盒内运行，网络访问被禁用，
+    /// 写入被限制在特定路径集合内。如果命令失败，将升级为要求用户批准无沙盒执行
     /// *All* commands are auto‑approved, but they are expected to run inside a
     /// sandbox where network access is disabled and writes are confined to a
     /// specific set of paths. If the command fails, it will be escalated to
     /// the user to approve execution without a sandbox.
     OnFailure,
 
+    /// 由模型决定何时向用户请求批准
     /// The model decides when to ask the user for approval.
     #[default]
     OnRequest,
 
+    /// 从不要求用户批准命令。失败立即返回给模型，从不升级为要求用户批准
     /// Never ask the user to approve commands. Failures are immediately returned
     /// to the model, and never escalated to the user for approval.
     Never,
 }
 
+/// 确定模型 shell 命令的执行限制
 /// Determines execution restrictions for model shell commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, TS)]
 #[strum(serialize_all = "kebab-case")]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum SandboxPolicy {
+    /// 完全没有限制。小心使用
     /// No restrictions whatsoever. Use with caution.
     #[serde(rename = "danger-full-access")]
     DangerFullAccess,
 
+    /// 对整个文件系统的只读访问
     /// Read-only access to the entire file-system.
     #[serde(rename = "read-only")]
     ReadOnly,
 
+    /// 与 `ReadOnly` 相同，但额外授予对当前工作目录（"工作空间"）的写访问权限
     /// Same as `ReadOnly` but additionally grants write access to the current
     /// working directory ("workspace").
     #[serde(rename = "workspace-write")]
@@ -266,11 +307,13 @@ impl FromStr for SandboxPolicy {
 }
 
 impl SandboxPolicy {
+    /// 返回具有只读磁盘访问权限且无网络访问权限的策略
     /// Returns a policy with read-only disk access and no network.
     pub fn new_read_only_policy() -> Self {
         SandboxPolicy::ReadOnly
     }
 
+    /// 返回可以读取整个磁盘但只能写入当前工作目录和 macOS 上每用户临时目录的策略。不允许网络访问
     /// Returns a policy that can read the entire disk, but can only write to
     /// the current working directory and the per-user tmp dir on macOS. It does
     /// not allow network access.
@@ -371,15 +414,22 @@ impl SandboxPolicy {
 #[non_exhaustive]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+
+// 将用户输入（可能包含一个文本和多个图片），这里将其拆解为多个 InputItem
+/// 用户输入项
+/// User input
 pub enum InputItem {
+    /// 文本输入
     Text {
         text: String,
     },
+    /// 预编码的数据 URI 图像
     /// Pre‑encoded data: URI image.
     Image {
         image_url: String,
     },
 
+    /// 用户提供的本地图像路径。在请求序列化期间将被转换为 `Image` 变体（base64 数据 URL）
     /// Local image path provided by the user.  This will be converted to an
     /// `Image` variant (base64 data URL) during request serialization.
     LocalImage {
@@ -387,36 +437,46 @@ pub enum InputItem {
     },
 }
 
+/// 事件队列条目 - 来自代理的事件
 /// Event Queue Entry - events from agent
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Event {
+    /// 此事件关联的提交 `id`
     /// Submission `id` that this event is correlated with.
     pub id: String,
+    /// 有效载荷
     /// Payload
     pub msg: EventMsg,
 }
 
+/// 来自代理的响应事件
 /// Response event from the agent
 #[derive(Debug, Clone, Deserialize, Serialize, Display)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum EventMsg {
+    /// 执行提交时发生错误
     /// Error while executing a submission
     Error(ErrorEvent),
 
+    /// 代理已开始任务
     /// Agent has started a task
     TaskStarted(TaskStartedEvent),
 
+    /// 代理已完成所有操作
     /// Agent has completed all actions
     TaskComplete(TaskCompleteEvent),
 
+    /// 令牌计数事件，定期发送以报告当前会话中使用的令牌数量
     /// Token count event, sent periodically to report the number of tokens
     /// used in the current session.
     TokenCount(TokenUsage),
 
+    /// 代理文本输出消息
     /// Agent text output message
     AgentMessage(AgentMessageEvent),
 
+    /// 代理文本输出增量消息
     /// Agent text output delta message
     AgentMessageDelta(AgentMessageDeltaEvent),
 

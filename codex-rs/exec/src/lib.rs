@@ -224,9 +224,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
                                 break;
                             }
                             if is_shutdown_complete {
+                                // 表示后台agent已经完全关闭，可以退出循环
                                 info!("Received shutdown event, exiting event loop.");
                                 break;
                             }
+                            // 没有break就表示继续循环等待下一个事件
                         },
                         Err(e) => {
                             error!("Error receiving event: {e:?}");

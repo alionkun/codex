@@ -1,3 +1,20 @@
+//! codex.rs - Codex 系统的核心实现
+//!
+//! 此文件是 Codex AI 编程助手的核心实现，包含：
+//! 1. Codex 主结构体：高级 API 接口，用于提交操作和接收事件
+//! 2. Session 管理：处理与 AI 模型的会话状态和生命周期
+//! 3. 任务执行：管理用户任务的运行，包括与模型的多轮对话
+//! 4. 工具调用：处理模型请求的函数调用（shell命令、文件操作、应用补丁等）
+//! 5. 安全机制：沙箱执行、命令审批和权限管理
+//! 6. 事件流：实时事件通信和状态更新
+//!
+//! 主要流程：
+//! - 用户通过 Codex::submit() 提交操作
+//! - submission_loop 处理操作并管理会话
+//! - run_task 执行具体任务，与模型进行多轮对话
+//! - handle_function_call 处理模型的工具调用请求
+//! - 通过事件流向客户端反馈执行状态和结果
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -127,6 +144,8 @@ use codex_protocol::models::WebSearchAction;
 // unrecoverable and should abort the program. This avoids scattered `.unwrap()`
 // calls on `lock()` while still surfacing a clear panic message when a lock is
 // poisoned.
+// 便利扩展特征，用于获取互斥锁，当锁中毒时会导致程序崩溃。
+// 这避免了在 lock() 上散布 .unwrap() 调用，同时在锁中毒时仍能显示清晰的恐慌消息。
 trait MutexExt<T> {
     fn lock_unchecked(&self) -> MutexGuard<'_, T>;
 }
@@ -140,67 +159,82 @@ impl<T> MutexExt<T> for Mutex<T> {
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
+/// Codex 系统的高级接口。
+/// 它作为一个队列对运行，您发送提交并接收事件。
 pub struct Codex {
-    next_id: AtomicU64,
-    tx_sub: Sender<Submission>,
-    rx_event: Receiver<Event>,
+    next_id: AtomicU64,         // 下一个提交ID的原子计数器
+    tx_sub: Sender<Submission>, // 用于发送提交的发送通道
+    rx_event: Receiver<Event>,  // 用于接收事件的接收通道
 }
 
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`],
 /// the submission id for the initial `ConfigureSession` request and the
 /// unique session id.
+/// 由 [`Codex::spawn`] 返回的包装器，包含生成的 [`Codex`]、
+/// 初始 `ConfigureSession` 请求的提交 ID 和唯一的会话 ID。
 pub struct CodexSpawnOk {
-    pub codex: Codex,
-    pub session_id: Uuid,
+    pub codex: Codex,     // 生成的 Codex 实例
+    pub session_id: Uuid, // 唯一的会话标识符
 }
 
+// 初始提交ID，用于配置会话等初始化操作
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
+// 提交通道的容量，控制并发提交数量
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
 
 // Model-formatting limits: clients get full streams; oonly content sent to the model is truncated.
-pub(crate) const MODEL_FORMAT_MAX_BYTES: usize = 10 * 1024; // 10 KiB
-pub(crate) const MODEL_FORMAT_MAX_LINES: usize = 256; // lines
-pub(crate) const MODEL_FORMAT_HEAD_LINES: usize = MODEL_FORMAT_MAX_LINES / 2;
-pub(crate) const MODEL_FORMAT_TAIL_LINES: usize = MODEL_FORMAT_MAX_LINES - MODEL_FORMAT_HEAD_LINES; // 128
-pub(crate) const MODEL_FORMAT_HEAD_BYTES: usize = MODEL_FORMAT_MAX_BYTES / 2;
+// 模型格式化限制：客户端获得完整流；只有发送给模型的内容会被截断。
+pub(crate) const MODEL_FORMAT_MAX_BYTES: usize = 10 * 1024; // 10 KiB // 最大字节数
+pub(crate) const MODEL_FORMAT_MAX_LINES: usize = 256; // lines // 最大行数
+pub(crate) const MODEL_FORMAT_HEAD_LINES: usize = MODEL_FORMAT_MAX_LINES / 2; // 头部保留行数
+pub(crate) const MODEL_FORMAT_TAIL_LINES: usize = MODEL_FORMAT_MAX_LINES - MODEL_FORMAT_HEAD_LINES; // 128 // 尾部保留行数
+pub(crate) const MODEL_FORMAT_HEAD_BYTES: usize = MODEL_FORMAT_MAX_BYTES / 2; // 头部字节预算
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
+    /// 生成一个新的 [`Codex`] 并初始化会话。
     pub async fn spawn(
-        config: Config,
-        auth_manager: Arc<AuthManager>,
-        initial_history: Option<Vec<ResponseItem>>,
+        config: Config,                             // 配置对象
+        auth_manager: Arc<AuthManager>,             // 认证管理器
+        initial_history: Option<Vec<ResponseItem>>, // 可选的初始历史记录
     ) -> CodexResult<CodexSpawnOk> {
+        // 创建有界的提交通道，用于发送用户操作
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        // 创建无界的事件通道，用于向客户端发送事件
         let (tx_event, rx_event) = async_channel::unbounded();
 
+        // 从配置中获取用户指令（例如 AGENTS.md 文件内容）
         let user_instructions = get_user_instructions(&config).await;
 
+        // 将配置包装在 Arc 中以便在多线程间共享
         let config = Arc::new(config);
+        // 获取实验性恢复路径（用于会话恢复功能）
         let resume_path = config.experimental_resume.clone();
 
+        // 构建会话配置对象，包含模型、策略等所有配置信息
         let configure_session = ConfigureSession {
-            provider: config.model_provider.clone(),
-            model: config.model.clone(),
-            model_reasoning_effort: config.model_reasoning_effort,
-            model_reasoning_summary: config.model_reasoning_summary,
-            user_instructions,
-            base_instructions: config.base_instructions.clone(),
-            approval_policy: config.approval_policy,
-            sandbox_policy: config.sandbox_policy.clone(),
-            disable_response_storage: config.disable_response_storage,
-            notify: config.notify.clone(),
-            cwd: config.cwd.clone(),
-            resume_path,
+            provider: config.model_provider.clone(), // 模型提供者（OpenAI、Claude等）
+            model: config.model.clone(),             // 具体模型名称
+            model_reasoning_effort: config.model_reasoning_effort, // 推理努力程度配置
+            model_reasoning_summary: config.model_reasoning_summary, // 推理摘要配置
+            user_instructions,                       // 用户自定义指令
+            base_instructions: config.base_instructions.clone(), // 基础系统指令
+            approval_policy: config.approval_policy, // 命令执行审批策略
+            sandbox_policy: config.sandbox_policy.clone(), // 沙箱安全策略
+            disable_response_storage: config.disable_response_storage, // 是否禁用响应存储
+            notify: config.notify.clone(),           // 通知命令配置
+            cwd: config.cwd.clone(),                 // 工作目录
+            resume_path,                             // 恢复路径
         };
 
         // Generate a unique ID for the lifetime of this Codex session.
+        // 为此 Codex 会话的生命周期生成唯一 ID。
         let (session, turn_context) = Session::new(
-            configure_session,
-            config.clone(),
-            auth_manager.clone(),
-            tx_event.clone(),
-            initial_history,
+            configure_session,    // 会话配置
+            config.clone(),       // 共享配置
+            auth_manager.clone(), // 认证管理器
+            tx_event.clone(),     // 事件发送通道
+            initial_history,      // 初始历史记录
         )
         .await
         .map_err(|e| {
@@ -210,35 +244,45 @@ impl Codex {
         let session_id = session.session_id;
 
         // This task will run until Op::Shutdown is received.
+        // 此任务将运行直到收到 Op::Shutdown 操作。
+        // 启动提交循环任务，负责处理所有用户提交的操作
         tokio::spawn(submission_loop(
-            session.clone(),
-            turn_context,
-            config,
-            rx_sub,
+            session.clone(), // 会话实例
+            turn_context,    // 对话轮次上下文
+            config,          // 配置
+            rx_sub,          // 提交接收通道
         ));
+
+        // 构建 Codex 实例，包含计数器和通道
         let codex = Codex {
-            next_id: AtomicU64::new(0),
-            tx_sub,
-            rx_event,
+            next_id: AtomicU64::new(0), // 从0开始的提交ID计数器
+            tx_sub,                     // 提交发送通道
+            rx_event,                   // 事件接收通道
         };
 
         Ok(CodexSpawnOk { codex, session_id })
     }
 
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
+    /// 提交一个操作，自动包装在具有唯一ID的提交中。
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
+        // 原子地获取下一个唯一ID
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .to_string();
+        // 创建提交对象
         let sub = Submission { id: id.clone(), op };
+        // 发送提交并返回ID
         self.submit_with_id(sub).await?;
         Ok(id)
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
     /// unique IDs for each submission.
+    /// 谨慎使用：首选 `submit()` 以便 Codex 负责为每个提交生成唯一ID。
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
+        // 将提交发送到处理循环，如果通道关闭则返回错误
         self.tx_sub
             .send(sub)
             .await
@@ -246,7 +290,9 @@ impl Codex {
         Ok(())
     }
 
+    /// 获取下一个事件，这是客户端接收 Codex 响应的主要方式。
     pub async fn next_event(&self) -> CodexResult<Event> {
+        // 从事件通道接收下一个事件
         let event = self
             .rx_event
             .recv()
@@ -257,57 +303,67 @@ impl Codex {
 }
 
 /// Mutable state of the agent
+/// 代理的可变状态
 #[derive(Default)]
 struct State {
-    approved_commands: HashSet<Vec<String>>,
-    current_task: Option<AgentTask>,
-    pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
-    pending_input: Vec<ResponseInputItem>,
-    history: ConversationHistory,
+    approved_commands: HashSet<Vec<String>>, // 已批准的命令集合（避免重复询问）
+    current_task: Option<AgentTask>,         // 当前运行的任务
+    pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>, // 待审批的操作及其响应通道
+    pending_input: Vec<ResponseInputItem>,   // 待处理的输入项
+    history: ConversationHistory,            // 对话历史记录
 }
 
 /// Context for an initialized model agent
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
+/// 已初始化模型代理的上下文
+/// 一个会话最多同时运行1个任务，可以被用户输入中断。
 pub(crate) struct Session {
-    session_id: Uuid,
-    tx_event: Sender<Event>,
+    session_id: Uuid,        // 会话唯一标识符
+    tx_event: Sender<Event>, // 事件发送通道
 
     /// Manager for external MCP servers/tools.
+    /// 外部 MCP 服务器/工具的管理器
     mcp_connection_manager: McpConnectionManager,
-    session_manager: ExecSessionManager,
+    session_manager: ExecSessionManager, // 执行会话管理器
 
     /// External notifier command (will be passed as args to exec()). When
     /// `None` this feature is disabled.
+    /// 外部通知命令（将作为参数传递给 exec()）。当为 None 时禁用此功能。
     notify: Option<Vec<String>>,
 
     /// Optional rollout recorder for persisting the conversation transcript so
     /// sessions can be replayed or inspected later.
+    /// 可选的 rollout 记录器，用于持久化对话记录，以便稍后重放或检查会话。
     rollout: Mutex<Option<RolloutRecorder>>,
-    state: Mutex<State>,
-    codex_linux_sandbox_exe: Option<PathBuf>,
-    user_shell: shell::Shell,
-    show_raw_agent_reasoning: bool,
+    state: Mutex<State>,                      // 受互斥锁保护的会话状态
+    codex_linux_sandbox_exe: Option<PathBuf>, // Linux 沙箱可执行文件路径
+    user_shell: shell::Shell,                 // 用户的默认 shell
+    show_raw_agent_reasoning: bool,           // 是否显示原始代理推理过程
 }
 
 /// The context needed for a single turn of the conversation.
+/// 单次对话轮次所需的上下文。
 #[derive(Debug)]
 pub(crate) struct TurnContext {
-    pub(crate) client: ModelClient,
+    pub(crate) client: ModelClient, // 模型客户端（用于与AI模型通信）
     /// The session's current working directory. All relative paths provided by
     /// the model as well as sandbox policies are resolved against this path
     /// instead of `std::env::current_dir()`.
+    /// 会话的当前工作目录。模型提供的所有相对路径以及沙箱策略都将相对于此路径解析，
+    /// 而不是 `std::env::current_dir()`。
     pub(crate) cwd: PathBuf,
-    pub(crate) base_instructions: Option<String>,
-    pub(crate) user_instructions: Option<String>,
-    pub(crate) approval_policy: AskForApproval,
-    pub(crate) sandbox_policy: SandboxPolicy,
-    pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
-    pub(crate) disable_response_storage: bool,
-    pub(crate) tools_config: ToolsConfig,
+    pub(crate) base_instructions: Option<String>, // 基础指令（系统级）
+    pub(crate) user_instructions: Option<String>, // 用户指令（来自 AGENTS.md 等）
+    pub(crate) approval_policy: AskForApproval,   // 审批策略（何时需要用户确认）
+    pub(crate) sandbox_policy: SandboxPolicy,     // 沙箱策略（安全限制）
+    pub(crate) shell_environment_policy: ShellEnvironmentPolicy, // Shell 环境策略
+    pub(crate) disable_response_storage: bool,    // 是否禁用响应存储
+    pub(crate) tools_config: ToolsConfig,         // 工具配置（可用的函数调用）
 }
 
 impl TurnContext {
+    /// 解析路径，将相对路径转换为基于当前工作目录的绝对路径
     fn resolve_path(&self, path: Option<String>) -> PathBuf {
         path.as_ref()
             .map(PathBuf::from)
@@ -316,32 +372,41 @@ impl TurnContext {
 }
 
 /// Configure the model session.
+/// 配置模型会话。
 struct ConfigureSession {
     /// Provider identifier ("openai", "openrouter", ...).
+    /// 提供者标识符（"openai", "openrouter", ...）
     provider: ModelProviderInfo,
 
     /// If not specified, server will use its default model.
+    /// 如果未指定，服务器将使用其默认模型。
     model: String,
 
-    model_reasoning_effort: ReasoningEffortConfig,
-    model_reasoning_summary: ReasoningSummaryConfig,
+    model_reasoning_effort: ReasoningEffortConfig, // 模型推理努力程度配置
+    model_reasoning_summary: ReasoningSummaryConfig, // 模型推理摘要配置
 
     /// Model instructions that are appended to the base instructions.
+    /// 附加到基础指令的模型指令。
     user_instructions: Option<String>,
 
     /// Base instructions override.
+    /// 基础指令覆盖。
     base_instructions: Option<String>,
 
     /// When to escalate for approval for execution
+    /// 何时升级以获得执行批准
     approval_policy: AskForApproval,
     /// How to sandbox commands executed in the system
+    /// 如何对系统中执行的命令进行沙箱处理
     sandbox_policy: SandboxPolicy,
     /// Disable server-side response storage (send full context each request)
+    /// 禁用服务器端响应存储（每次请求发送完整上下文）
     disable_response_storage: bool,
 
     /// Optional external notifier command tokens. Present only when the
     /// client wants the agent to spawn a program after each completed
     /// turn.
+    /// 可选的外部通知器命令标记。仅当客户端希望代理在每次完成轮次后生成程序时才存在。
     notify: Option<Vec<String>>,
 
     /// Working directory that should be treated as the *root* of the
@@ -351,9 +416,12 @@ struct ConfigureSession {
     /// expected to expand this to an absolute path before sending the
     /// `ConfigureSession` operation so that the business-logic layer can
     /// operate deterministically.
+    /// 应被视为会话*根目录*的工作目录。模型提供的所有相对路径以及执行沙箱都将
+    /// 相对于此目录解析，**而不是**进程范围的当前工作目录。CLI 前端应在发送 `ConfigureSession`
+    /// 操作之前将其扩展为绝对路径，以便业务逻辑层可以确定性地操作。
     cwd: PathBuf,
 
-    resume_path: Option<PathBuf>,
+    resume_path: Option<PathBuf>, // 恢复路径（用于会话恢复）
 }
 
 impl Session {
@@ -966,26 +1034,30 @@ impl Drop for Session {
     }
 }
 
+/// 执行命令的上下文信息
 #[derive(Clone, Debug)]
 pub(crate) struct ExecCommandContext {
-    pub(crate) sub_id: String,
-    pub(crate) call_id: String,
-    pub(crate) command_for_display: Vec<String>,
-    pub(crate) cwd: PathBuf,
-    pub(crate) apply_patch: Option<ApplyPatchCommandContext>,
+    pub(crate) sub_id: String,                                // 提交ID
+    pub(crate) call_id: String,                               // 调用ID
+    pub(crate) command_for_display: Vec<String>,              // 用于显示的命令
+    pub(crate) cwd: PathBuf,                                  // 工作目录
+    pub(crate) apply_patch: Option<ApplyPatchCommandContext>, // 可选的补丁应用上下文
 }
 
+/// 应用补丁命令的上下文
 #[derive(Clone, Debug)]
 pub(crate) struct ApplyPatchCommandContext {
-    pub(crate) user_explicitly_approved_this_action: bool,
-    pub(crate) changes: HashMap<PathBuf, FileChange>,
+    pub(crate) user_explicitly_approved_this_action: bool, // 用户是否明确批准此操作
+    pub(crate) changes: HashMap<PathBuf, FileChange>,      // 文件变更映射
 }
 
 /// A series of Turns in response to user input.
+/// 响应用户输入的一系列轮次。
+/// 代表一个可中断的代理任务，管理与模型的多轮对话。
 pub(crate) struct AgentTask {
-    sess: Arc<Session>,
-    sub_id: String,
-    handle: AbortHandle,
+    sess: Arc<Session>,  // 会话实例
+    sub_id: String,      // 提交ID
+    handle: AbortHandle, // 任务中断句柄
 }
 
 impl AgentTask {
@@ -1048,21 +1120,34 @@ impl AgentTask {
     }
 }
 
+/// 提交循环 - Codex 系统的核心调度器
+///
+/// 这是整个系统的心脏，负责：
+/// 1. 接收和处理所有用户提交的操作
+/// 2. 管理会话状态和上下文
+/// 3. 调度任务执行和中断
+/// 4. 处理配置覆盖和模型切换
+/// 5. 协调各种操作（用户输入、审批、历史记录等）
 async fn submission_loop(
-    sess: Arc<Session>,
-    turn_context: TurnContext,
-    config: Arc<Config>,
-    rx_sub: Receiver<Submission>,
+    sess: Arc<Session>,           // 会话实例
+    turn_context: TurnContext,    // 初始轮次上下文
+    config: Arc<Config>,          // 配置
+    rx_sub: Receiver<Submission>, // 提交接收通道
 ) {
     // Wrap once to avoid cloning TurnContext for each task.
+    // 包装一次以避免为每个任务克隆 TurnContext
     let mut turn_context = Arc::new(turn_context);
     // To break out of this loop, send Op::Shutdown.
+    // 要跳出此循环，发送 Op::Shutdown
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
+        // 根据操作类型进行分发处理
         match sub.op {
+            // 中断当前任务
             Op::Interrupt => {
                 sess.interrupt_task();
             }
+            // 覆盖轮次上下文（更改模型、策略等）
             Op::OverrideTurnContext {
                 cwd,
                 approval_policy,
@@ -1403,15 +1488,24 @@ async fn submission_loop(
 ///   back to the model in the next turn.
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the task complete.
+/// 接受用户消息作为输入并运行一个循环，在每个轮次中，模型回复以下之一：
+/// - 请求的函数调用
+/// - 助手消息
+/// 虽然模型可能在单个轮次中返回多个这些项，但在实践中，我们通常每轮次一个项：
+/// - 如果模型请求函数调用，我们执行它并在下一轮次将输出发送回模型。
+/// - 如果模型只发送助手消息，我们将其记录在对话历史中并认为任务完成。
 async fn run_task(
-    sess: Arc<Session>,
-    turn_context: &TurnContext,
-    sub_id: String,
-    input: Vec<InputItem>,
+    sess: Arc<Session>,         // 会话实例
+    turn_context: &TurnContext, // 轮次上下文
+    sub_id: String,             // 提交ID
+    input: Vec<InputItem>,      // 输入项列表
 ) {
+    // 如果输入为空，直接返回
     if input.is_empty() {
         return;
     }
+
+    // 发送任务开始事件，通知客户端任务已开始
     let event = Event {
         id: sub_id.clone(),
         msg: EventMsg::TaskStarted(TaskStartedEvent {
@@ -1422,6 +1516,7 @@ async fn run_task(
         return;
     }
 
+    // 将初始输入转换为响应输入项并记录到对话历史
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
     sess.record_conversation_items(&[initial_input_for_turn.clone().into()])
         .await;
@@ -1429,12 +1524,17 @@ async fn run_task(
     let mut last_agent_message: Option<String> = None;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
+    // 从 codex.rs 的角度来看，TurnDiffTracker 具有包含多个轮次的任务的生命周期，
+    // 但从用户的角度来看，这是单个轮次。
     let mut turn_diff_tracker = TurnDiffTracker::new();
 
+    // 主任务循环，处理与模型的多轮对话
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
+        // pending_input 是用户在模型运行时通过 UI 提交的消息。
+        // 虽然 UI 可能支持这一点，但模型可能不支持。
         let pending_input = sess
             .get_pending_input()
             .into_iter()
@@ -1447,6 +1547,9 @@ async fn run_task(
         // conversation history on each turn. The rollout file, however, should
         // only record the new items that originated in this turn so that it
         // represents an append-only log without duplicates.
+        // 构建我们将发送给模型的输入。使用聊天完成 API（或 ZDR 客户端）时，
+        // 模型需要每轮的完整对话历史。但是，rollout 文件应仅记录此轮次中产生的新项，
+        // 以便它表示无重复的仅追加日志。
         let turn_input: Vec<ResponseItem> = sess.turn_input_with_history(pending_input);
 
         let turn_input_messages: Vec<String> = turn_input
@@ -2099,16 +2202,19 @@ async fn handle_response_item(
     Ok(output)
 }
 
+/// 处理模型请求的函数调用，根据函数名分发到对应的处理器
 async fn handle_function_call(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_diff_tracker: &mut TurnDiffTracker,
-    sub_id: String,
-    name: String,
-    arguments: String,
-    call_id: String,
+    sess: &Session,                          // 会话实例
+    turn_context: &TurnContext,              // 轮次上下文
+    turn_diff_tracker: &mut TurnDiffTracker, // 差异跟踪器
+    sub_id: String,                          // 提交ID
+    name: String,                            // 函数名
+    arguments: String,                       // 函数参数（JSON字符串）
+    call_id: String,                         // 调用ID
 ) -> ResponseInputItem {
+    // 根据函数名匹配并执行相应的处理逻辑
     match name.as_str() {
+        // 处理容器执行或shell命令
         "container.exec" | "shell" => {
             let params = match parse_container_exec_arguments(arguments, turn_context, &call_id) {
                 Ok(params) => params,
@@ -2126,6 +2232,7 @@ async fn handle_function_call(
             )
             .await
         }
+        // 处理查看图片请求
         "view_image" => {
             #[derive(serde::Deserialize)]
             struct SeeImageArgs {
@@ -2729,6 +2836,7 @@ async fn handle_sandbox_error(
     }
 }
 
+/// 格式化执行输出字符串，对长输出进行头尾截断以适应模型的输入限制
 fn format_exec_output_str(exec_output: &ExecToolCallOutput) -> String {
     let ExecToolCallOutput {
         aggregated_output, ..
@@ -2736,9 +2844,12 @@ fn format_exec_output_str(exec_output: &ExecToolCallOutput) -> String {
 
     // Head+tail truncation for the model: show the beginning and end with an elision.
     // Clients still receive full streams; only this formatted summary is capped.
+    // 为模型进行头尾截断：显示开头和结尾，中间用省略号。
+    // 客户端仍然接收完整流；只有这个格式化摘要被限制。
 
     let s = aggregated_output.text.as_str();
     let total_lines = s.lines().count();
+    // 如果输出在限制范围内，直接返回原文本
     if s.len() <= MODEL_FORMAT_MAX_BYTES && total_lines <= MODEL_FORMAT_MAX_LINES {
         return s.to_string();
     }
@@ -2792,6 +2903,7 @@ fn format_exec_output_str(exec_output: &ExecToolCallOutput) -> String {
 }
 
 // Truncate a &str to a byte budget at a char boundary (prefix)
+// 在字符边界处将 &str 截断到字节预算（前缀）
 #[inline]
 fn take_bytes_at_char_boundary(s: &str, maxb: usize) -> &str {
     if s.len() <= maxb {
@@ -2809,6 +2921,7 @@ fn take_bytes_at_char_boundary(s: &str, maxb: usize) -> &str {
 }
 
 // Take a suffix of a &str within a byte budget at a char boundary
+// 在字符边界处获取 &str 的后缀，在字节预算内
 #[inline]
 fn take_last_bytes_at_char_boundary(s: &str, maxb: usize) -> &str {
     if s.len() <= maxb {
